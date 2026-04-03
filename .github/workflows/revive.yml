@@ -1,0 +1,34 @@
+name: Kaggle Zombie Bot Revival
+
+on:
+  schedule:
+    - cron: '0 */11 * * *'
+  workflow_dispatch:
+
+jobs:
+  revive-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: إعداد بيئة لينكس
+        uses: actions/checkout@v3
+
+      - name: تجهيز لغة بايثون
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: تثبيت مكتبة كاجل الرسمية
+        run: pip install kaggle
+
+      - name: حقن بيانات الاعتماد
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"jvnngmg","key":"KGAT_176a325bf71fb7d4a2de5673d3e6388e"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: سحب وإعادة إطلاق البوت
+        run: |
+          mkdir -p bot_code
+          kaggle kernels pull jvnngmg/quran-radio-bot -p bot_code
+          kaggle kernels push -p bot_code
+          echo "✅ تم إعادة تشغيل البوت على Kaggle"
