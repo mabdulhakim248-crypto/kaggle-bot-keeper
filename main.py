@@ -47,6 +47,7 @@ from telebot.types import (
 )
 
 import radio
+import youtube
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +68,10 @@ MAX_TG_MSG = 4000
 _waiting_bg: set[str] = set()
 _waiting_yt_title: set[str] = set()
 _waiting_yt_desc: set[str] = set()
+
+# YouTube states
+_yt_auth_pending: set[str] = set()           # waiting for OAuth code
+_yt_upload_pending: dict[str, dict] = {}     # waiting for video file {uid: {title,desc,privacy}}
 
 
 def _send_long_message(chat_id: int, text: str):
@@ -693,6 +698,24 @@ def handle_message(msg: Message):
     if not user_text:
         return
 
+    if uid in _yt_auth_pending:
+        _yt_auth_pending.discard(uid)
+        status_msg = bot.reply_to(msg, "⏳ جاري التحقق من الكود...")
+        def _do_auth():
+            try:
+                youtube.exchange_code(user_text)
+                ch = youtube.get_channel_info()
+                bot.edit_message_text(
+                    f"✅ تم تسجيل الدخول بنجاح!\n\n"
+                    f"📺 القناة: {ch['title']}\n"
+                    f"👥 مشتركين: {ch['subscribers']}",
+                    chat_id=msg.chat.id, message_id=status_msg.message_id)
+            except Exception as e:
+                bot.edit_message_text(f"❌ فشل التحقق: {e}",
+                    chat_id=msg.chat.id, message_id=status_msg.message_id)
+        threading.Thread(target=_do_auth, daemon=True).start()
+        return
+
     if uid in _waiting_yt_title:
         _waiting_yt_title.discard(uid)
         info = radio.get_youtube_stream_info()
@@ -1020,6 +1043,351 @@ def channel_resume(msg: Message):
         bot.send_message(msg.chat.id, "▶️ تم استئناف البث!")
     else:
         bot.send_message(msg.chat.id, "خطأ في استئناف البث.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  YouTube Control Commands
+# ═══════════════════════════════════════════════════════════════════════════
+
+@bot.message_handler(commands=["ytauth"])
+def cmd_ytauth(msg: Message):
+    uid = str(msg.from_user.id)
+    if msg.chat.type != "private":
+        bot.reply_to(msg, "🔐 أرسل هذا الأمر في المحادثة الخاصة مع البوت.")
+        return
+    try:
+        url = youtube.get_auth_url()
+    except RuntimeError as e:
+        bot.reply_to(msg,
+            f"❌ {e}\n\n"
+            "لإضافة credentials:\n"
+            "1. اشرح لي وهشرح لك إزاي تعمل Google Cloud Project\n"
+            "2. أو بعتلي YT_CLIENT_ID و YT_CLIENT_SECRET"
+        )
+        return
+    _yt_auth_pending.add(uid)
+    bot.reply_to(msg,
+        f"🔐 افتح الرابط ده واسمح للبوت:\n\n{url}\n\n"
+        "بعد الموافقة، انسخ الكود اللي هيظهر وابعته هنا."
+    )
+
+
+@bot.message_handler(commands=["ytchannel"])
+def cmd_ytchannel(msg: Message):
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب. ابعت /ytauth أولاً.")
+        return
+    def _do():
+        try:
+            ch = youtube.get_channel_info()
+            bot.reply_to(msg,
+                f"📺 معلومات القناة:\n\n"
+                f"🏷 الاسم: {ch['title']}\n"
+                f"👥 مشتركين: {ch['subscribers']}\n"
+                f"👁 مشاهدات: {ch['views']}\n"
+                f"🎬 فيديوهات: {ch['videos']}\n"
+                f"🔗 يوتيوب: https://youtube.com/channel/{ch['id']}"
+            )
+        except Exception as e:
+            bot.reply_to(msg, f"❌ خطأ: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(commands=["ytupload"])
+def cmd_ytupload(msg: Message):
+    uid = str(msg.from_user.id)
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب. ابعت /ytauth أولاً.")
+        return
+    parts = msg.text.strip().split("\n", 3)
+    params = parts[0].split(maxsplit=1)
+    title   = parts[1].strip() if len(parts) > 1 else "فيديو جديد"
+    desc    = parts[2].strip() if len(parts) > 2 else ""
+    privacy = parts[3].strip().lower() if len(parts) > 3 else "private"
+    if privacy not in ("public", "private", "unlisted"):
+        privacy = "private"
+    _yt_upload_pending[uid] = {"title": title, "desc": desc, "privacy": privacy}
+    bot.reply_to(msg,
+        f"📤 جاهز للرفع!\n\n"
+        f"🏷 العنوان: {title}\n"
+        f"🔒 الخصوصية: {privacy}\n\n"
+        "ابعت ملف الفيديو الآن."
+    )
+
+
+@bot.message_handler(commands=["ytschedule"])
+def cmd_ytschedule(msg: Message):
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب. ابعت /ytauth أولاً.")
+        return
+    lines = msg.text.strip().split("\n")
+    if len(lines) < 2:
+        bot.reply_to(msg,
+            "📅 الاستخدام:\n"
+            "/ytschedule\n"
+            "العنوان\n"
+            "2025-04-10T18:00:00+03:00\n"
+            "الوصف (اختياري)\n"
+            "public/private/unlisted (اختياري)"
+        )
+        return
+    title      = lines[1].strip() if len(lines) > 1 else "بث مباشر"
+    start_time = lines[2].strip() if len(lines) > 2 else ""
+    description = lines[3].strip() if len(lines) > 3 else ""
+    privacy     = lines[4].strip().lower() if len(lines) > 4 else "public"
+    if not start_time:
+        bot.reply_to(msg, "❌ لازم تحدد وقت البدء بصيغة ISO: 2025-04-10T18:00:00+03:00")
+        return
+    status_msg = bot.reply_to(msg, "⏳ جاري إنشاء البث المجدول...")
+    def _do():
+        try:
+            result = youtube.schedule_broadcast(title, start_time, description, privacy)
+            bot.edit_message_text(
+                f"✅ تم جدولة البث!\n\n"
+                f"🏷 العنوان: {result['title']}\n"
+                f"🕐 الوقت: {result['start_time']}\n"
+                f"🔗 الرابط: {result['watch_url']}\n\n"
+                f"🎙 RTMP URL:\n`{result['rtmp_url']}`\n\n"
+                f"🔑 Stream Key:\n`{result['stream_key']}`\n\n"
+                "✅ لتشغيل البث تلقائياً في الوقت المحدد:\n"
+                f"/ytgo {result['broadcast_id']}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id,
+            )
+        except Exception as e:
+            log.error(f"YT schedule error: {e}", exc_info=True)
+            bot.edit_message_text(f"❌ خطأ: {e}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id)
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(commands=["ytlist"])
+def cmd_ytlist(msg: Message):
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب. ابعت /ytauth أولاً.")
+        return
+    parts = msg.text.strip().split()
+    mode = parts[1] if len(parts) > 1 else "broadcasts"
+    status_msg = bot.reply_to(msg, "⏳ جاري الجلب...")
+    def _do():
+        try:
+            if mode == "videos":
+                items = youtube.list_videos(10)
+                if not items:
+                    bot.edit_message_text("لا توجد فيديوهات.",
+                        chat_id=msg.chat.id, message_id=status_msg.message_id)
+                    return
+                text = "🎬 آخر الفيديوهات:\n\n"
+                for v in items:
+                    text += f"• {v['title']}\n  🔗 {v['url']} | 📅 {v['date']}\n  🗑 /ytvdel_{v['id']}\n\n"
+            else:
+                items = youtube.list_broadcasts("all")
+                if not items:
+                    bot.edit_message_text("لا توجد بثوث.",
+                        chat_id=msg.chat.id, message_id=status_msg.message_id)
+                    return
+                status_map = {
+                    "ready": "جاهز", "live": "🔴 مباشر",
+                    "complete": "منتهي", "created": "مُنشأ",
+                    "testStarting": "اختبار", "liveStarting": "جاري البدء",
+                }
+                text = "📺 البثوث المباشرة:\n\n"
+                for b in items:
+                    st = status_map.get(b['status'], b['status'])
+                    text += (f"• {b['title']}\n"
+                             f"  📊 {st} | 🔒 {b['privacy']}\n"
+                             f"  🕐 {b['start'][:16].replace('T',' ') if b['start'] else '-'}\n"
+                             f"  🔗 {b['watch_url']}\n"
+                             f"  🗑 /ytbdel_{b['id']}\n\n")
+            _send_long_message(msg.chat.id, text)
+            bot.delete_message(msg.chat.id, status_msg.message_id)
+        except Exception as e:
+            bot.edit_message_text(f"❌ خطأ: {e}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id)
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(commands=["ytgo"])
+def cmd_ytgo(msg: Message):
+    """Start streaming to a scheduled broadcast immediately."""
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب. ابعت /ytauth أولاً.")
+        return
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(msg, "الاستخدام: /ytgo <broadcast_id>")
+        return
+    broadcast_id = parts[1]
+    status_msg = bot.reply_to(msg, "⏳ جاري جلب بيانات البث...")
+    def _do():
+        try:
+            import requests as _req
+            r = _req.get(
+                "https://www.googleapis.com/youtube/v3/liveBroadcasts",
+                headers=youtube._headers(),
+                params={"part": "id,snippet,contentDetails", "id": broadcast_id},
+                timeout=10,
+            )
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            if not items:
+                bot.edit_message_text("❌ لم يُعثر على البث.",
+                    chat_id=msg.chat.id, message_id=status_msg.message_id)
+                return
+            bound = items[0]["contentDetails"].get("boundStreamId", "")
+            if not bound:
+                bot.edit_message_text("❌ هذا البث ليس مرتبطاً بـ stream.",
+                    chat_id=msg.chat.id, message_id=status_msg.message_id)
+                return
+            ls_r = _req.get(
+                "https://www.googleapis.com/youtube/v3/liveStreams",
+                headers=youtube._headers(),
+                params={"part": "cdn", "id": bound},
+                timeout=10,
+            )
+            ls_r.raise_for_status()
+            ls_items = ls_r.json().get("items", [])
+            if not ls_items:
+                bot.edit_message_text("❌ لم يُعثر على stream.",
+                    chat_id=msg.chat.id, message_id=status_msg.message_id)
+                return
+            ing = ls_items[0]["cdn"]["ingestionInfo"]
+            rtmp_full = f"{ing['ingestionAddress']}/{ing['streamName']}"
+            bot.edit_message_text(
+                f"✅ بيانات البث:\n\n"
+                f"🎙 RTMP: `{ing['ingestionAddress']}`\n"
+                f"🔑 Key: `{ing['streamName']}`\n\n"
+                "استخدم هذا الـ RTMP في FFmpeg أو OBS لبدء البث.",
+                chat_id=msg.chat.id, message_id=status_msg.message_id,
+            )
+        except Exception as e:
+            bot.edit_message_text(f"❌ خطأ: {e}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id)
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(commands=["ytstop"])
+def cmd_ytstop_broadcast(msg: Message):
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب. ابعت /ytauth أولاً.")
+        return
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(msg, "الاستخدام: /ytstop <broadcast_id>")
+        return
+    bid = parts[1]
+    def _do():
+        try:
+            ok = youtube.transition_broadcast(bid, "complete")
+            if ok:
+                bot.reply_to(msg, f"✅ تم إنهاء البث {bid}.")
+            else:
+                bot.reply_to(msg, f"❌ تعذّر إنهاء البث {bid}.")
+        except Exception as e:
+            bot.reply_to(msg, f"❌ خطأ: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(regexp=r"^/ytbdel_")
+def cmd_ytbdel(msg: Message):
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب.")
+        return
+    bid = msg.text.strip().replace("/ytbdel_", "").split()[0]
+    def _do():
+        try:
+            ok = youtube.delete_broadcast(bid)
+            bot.reply_to(msg, f"✅ تم حذف البث." if ok else f"❌ تعذّر حذف البث.")
+        except Exception as e:
+            bot.reply_to(msg, f"❌ خطأ: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(regexp=r"^/ytvdel_")
+def cmd_ytvdel(msg: Message):
+    if not youtube.is_authenticated():
+        bot.reply_to(msg, "❌ مش متصل بيوتيوب.")
+        return
+    vid = msg.text.strip().replace("/ytvdel_", "").split()[0]
+    def _do():
+        try:
+            ok = youtube.delete_video(vid)
+            bot.reply_to(msg, f"✅ تم حذف الفيديو." if ok else f"❌ تعذّر حذف الفيديو.")
+        except Exception as e:
+            bot.reply_to(msg, f"❌ خطأ: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+
+@bot.message_handler(content_types=["video", "document"])
+def handle_video_upload(msg: Message):
+    uid = str(msg.from_user.id)
+    if uid not in _yt_upload_pending:
+        return
+    info = _yt_upload_pending.pop(uid)
+    status_msg = bot.reply_to(msg, "⏳ جاري تنزيل الفيديو...")
+    def _do():
+        import tempfile, os as _os
+        tmp_path = None
+        try:
+            file_id = None
+            if msg.video:
+                file_id = msg.video.file_id
+                ext = ".mp4"
+            elif msg.document and msg.document.mime_type and "video" in msg.document.mime_type:
+                file_id = msg.document.file_id
+                ext = _os.path.splitext(msg.document.file_name or ".mp4")[1] or ".mp4"
+            else:
+                bot.edit_message_text("❌ الملف المرسل ليس فيديو.",
+                    chat_id=msg.chat.id, message_id=status_msg.message_id)
+                return
+            file_info = bot.get_file(file_id)
+            dl_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+            import requests as _req
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp_path = tmp.name
+                with _req.get(dl_url, stream=True, timeout=300) as r:
+                    r.raise_for_status()
+                    downloaded = 0
+                    total = int(r.headers.get("Content-Length", 0))
+                    for chunk in r.iter_content(65536):
+                        tmp.write(chunk)
+                        downloaded += len(chunk)
+            bot.edit_message_text(
+                f"✅ تم التنزيل! جاري الرفع على يوتيوب...\n🏷 {info['title']}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id)
+            last_pct = [0]
+            def progress(sent, total_b):
+                pct = int(sent / total_b * 100) if total_b else 0
+                if pct - last_pct[0] >= 10:
+                    last_pct[0] = pct
+                    try:
+                        bot.edit_message_text(
+                            f"📤 جاري الرفع... {pct}%\n🏷 {info['title']}",
+                            chat_id=msg.chat.id, message_id=status_msg.message_id)
+                    except Exception:
+                        pass
+            video = youtube.upload_video(
+                tmp_path,
+                title=info["title"],
+                description=info.get("desc", ""),
+                privacy=info.get("privacy", "private"),
+                progress_cb=progress,
+            )
+            vid_id = video["id"]
+            bot.edit_message_text(
+                f"✅ تم الرفع بنجاح!\n\n"
+                f"🎬 {info['title']}\n"
+                f"🔗 https://youtu.be/{vid_id}\n"
+                f"🔒 {info['privacy']}\n\n"
+                f"🗑 لحذفه: /ytvdel_{vid_id}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id)
+        except Exception as e:
+            log.error(f"YT upload error: {e}", exc_info=True)
+            bot.edit_message_text(f"❌ خطأ في الرفع: {e}",
+                chat_id=msg.chat.id, message_id=status_msg.message_id)
+        finally:
+            if tmp_path and _os.path.exists(tmp_path):
+                _os.remove(tmp_path)
+    threading.Thread(target=_do, daemon=True).start()
 
 
 if __name__ == "__main__":
