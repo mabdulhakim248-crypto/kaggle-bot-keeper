@@ -89,8 +89,13 @@ _yt_streams: dict[str, dict] = {}
 def save_streams_state():
     state = {
         "tg": {
-            str(cid): {"url": info.get("url",""), "title": info.get("title","بث مباشر"), "is_yt": info.get("is_yt", False)}
-            for cid, info in _active_streams.items() if info.get("url")
+            str(cid): {
+                "url": info.get("yt_url") or info.get("url",""),
+                "title": info.get("title","بث مباشر"),
+                "is_yt": info.get("is_yt", False),
+                "yt_url": info.get("yt_url",""),
+            }
+            for cid, info in _active_streams.items() if info.get("url") or info.get("yt_url")
         },
         "yt": {
             tag: {"url": info.get("url",""), "title": info.get("title","بث مباشر")}
@@ -377,7 +382,68 @@ def _build_rtmp_ffmpeg(stream_url: str, rtmp_target: str, image_path: str | None
     return cmd
 
 
-async def _async_play_yt(chat_id: int, stream_url: str):
+async def _yt_watchdog(chat_id: int, yt_url: str, rtmp_target: str):
+    """Background watchdog: monitors FFmpeg and restarts with a fresh URL when it exits."""
+    import subprocess
+    log.info(f"[YT watchdog] Started for chat {chat_id}")
+    await asyncio.sleep(10)
+
+    while True:
+        if chat_id not in _active_streams:
+            log.info(f"[YT watchdog] Stream {chat_id} was stopped — watchdog exiting")
+            return
+
+        info = _active_streams.get(chat_id, {})
+        proc = info.get("proc")
+
+        if proc is None or proc.poll() is None:
+            await asyncio.sleep(30)
+            continue
+
+        ret = proc.poll()
+        try:
+            stderr_out = proc.stderr.read().decode(errors="replace")[-400:]
+        except Exception:
+            stderr_out = ""
+        log.warning(f"[YT watchdog] FFmpeg exited (code {ret}) for {chat_id}: {stderr_out}")
+
+        if chat_id not in _active_streams:
+            log.info(f"[YT watchdog] Stream {chat_id} was stopped — watchdog exiting")
+            return
+
+        log.info(f"[YT watchdog] Refreshing YouTube URL for chat {chat_id}…")
+        try:
+            loop = asyncio.get_event_loop()
+            yt_info = await loop.run_in_executor(None, lambda: extract_youtube_url(yt_url))
+            fresh_url = yt_info["url"]
+        except Exception as e:
+            log.error(f"[YT watchdog] Failed to get fresh URL: {e} — retrying in 60s")
+            await asyncio.sleep(60)
+            continue
+
+        cmd = _build_rtmp_ffmpeg_yt(fresh_url, rtmp_target, _BG_IMAGE)
+        log.info(f"[YT watchdog] Restarting FFmpeg for chat {chat_id}")
+        try:
+            new_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except Exception as e:
+            log.error(f"[YT watchdog] Failed to start FFmpeg: {e}")
+            await asyncio.sleep(30)
+            continue
+
+        if chat_id in _active_streams:
+            _active_streams[chat_id]["proc"] = new_proc
+
+        await asyncio.sleep(5)
+        ret2 = new_proc.poll()
+        if ret2 is not None:
+            stderr2 = new_proc.stderr.read().decode(errors="replace")[-300:]
+            log.error(f"[YT watchdog] FFmpeg exited immediately (code {ret2}): {stderr2}")
+            await asyncio.sleep(20)
+        else:
+            log.info(f"[YT watchdog] FFmpeg restarted OK (PID {new_proc.pid}) for {chat_id}")
+
+
+async def _async_play_yt(chat_id: int, stream_url: str, yt_url: str = ""):
     import subprocess
     import random
     from pyrogram.raw.functions.channels import GetFullChannel
@@ -421,11 +487,13 @@ async def _async_play_yt(chat_id: int, stream_url: str):
     if chat_id in _active_streams:
         _active_streams[chat_id]["proc"] = proc
         _active_streams[chat_id]["type"] = "rtmp"
+        _active_streams[chat_id]["yt_url"] = yt_url
     else:
         _active_streams[chat_id] = {
             "proc": proc, "type": "rtmp",
-            "url": stream_url, "title": "بث مباشر",
+            "url": yt_url or stream_url, "title": "بث مباشر",
             "started_at": time.time(),
+            "yt_url": yt_url,
         }
 
     await asyncio.sleep(5)
@@ -435,22 +503,27 @@ async def _async_play_yt(chat_id: int, stream_url: str):
         raise RuntimeError(f"FFmpeg exited immediately (code {ret}): {stderr[-500:]}")
     log.info(f"[YT→TG] RTMP stream running (PID {proc.pid})")
 
+    if yt_url:
+        asyncio.ensure_future(_yt_watchdog(chat_id, yt_url, rtmp_target))
+        log.info(f"[YT→TG] Watchdog scheduled for chat {chat_id}")
 
-def start_stream_yt(chat_id: int, stream_url: str, title: str = "بث مباشر"):
+
+def start_stream_yt(chat_id: int, stream_url: str, title: str = "بث مباشر", yt_url: str = ""):
     _init_client()
 
     if chat_id in _active_streams:
         stop_stream(chat_id)
 
     _active_streams[chat_id] = {
-        "url": stream_url,
+        "url": yt_url or stream_url,
         "title": title,
         "started_at": time.time(),
         "is_yt": True,
+        "yt_url": yt_url,
     }
 
     try:
-        _run_async(_async_play_yt(chat_id, stream_url))
+        _run_async(_async_play_yt(chat_id, stream_url, yt_url=yt_url))
         log.info(f"[YT→TG] Live stream started in chat {chat_id}")
         save_streams_state()
     except Exception:
