@@ -49,4 +49,5 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          GH_SYNC_TOKEN: ${{ secrets.GH_SYNC_TOKEN }}
         run: python3 revive_push.py
